@@ -58,6 +58,8 @@ uint8_t mavlinkSSBuffer[CRSF_MAX_PACKET_LEN]; // Buffer for current stubbon send
 extern bool webserverPreventAutoStart;
 //// MSP Data Handling ///////
 bool NextPacketIsDataUl = false;  // if true the next packet will contain the uplink data (instead of channels)
+static constexpr uint8_t MAVLINK_DATA_UL_BURST_PACKETS = 2;
+static uint8_t MavlinkDataUlBurstRemaining = 0;
 char backpackVersion[32] = "";
 
 ////////////SYNC PACKET/////////
@@ -560,11 +562,13 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
   }
   else
   {
+    const bool isMavlinkMode = config.GetLinkMode() == TX_MAVLINK_MODE;
+    const bool isMavlinkDataUlPriority = isMavlinkMode && DataUlSender.IsActive() && MavlinkDataUlBurstRemaining > 0;
     if (firmwareOptions.is_airport)
     {
       OtaPackAirportData(&otaPkt, &apInputBuffer);
     }
-    else if ((NextPacketIsDataUl && DataUlSender.IsActive()) || dontSendChannelData)
+    else if ((NextPacketIsDataUl && DataUlSender.IsActive()) || dontSendChannelData || isMavlinkDataUlPriority)
     {
       otaPkt.std.type = PACKET_TYPE_DATA;
       if (OtaIsFullRes)
@@ -572,7 +576,7 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
         otaPkt.full.data_ul.packageIndex = DataUlSender.GetCurrentPayload(
           otaPkt.full.data_ul.payload,
           sizeof(otaPkt.full.data_ul.payload));
-        if (config.GetLinkMode() == TX_MAVLINK_MODE)
+        if (isMavlinkMode)
           otaPkt.full.data_ul.stubbornAck = DataDlReceiver.GetCurrentConfirm();
       }
       else
@@ -580,12 +584,20 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
         otaPkt.std.data_ul.packageIndex = DataUlSender.GetCurrentPayload(
           otaPkt.std.data_ul.payload,
           sizeof(otaPkt.std.data_ul.payload));
-        if (config.GetLinkMode() == TX_MAVLINK_MODE)
+        if (isMavlinkMode)
           otaPkt.std.data_ul.stubbornAck = DataDlReceiver.GetCurrentConfirm();
       }
 
-      // send channel data next so the channel messages also get sent during data uplink transmissions
-      NextPacketIsDataUl = false;
+      if (isMavlinkMode && !dontSendChannelData && MavlinkDataUlBurstRemaining > 0)
+      {
+        MavlinkDataUlBurstRemaining--;
+        NextPacketIsDataUl = MavlinkDataUlBurstRemaining > 0;
+      }
+      else
+      {
+        // send channel data next so the channel messages also get sent during data uplink transmissions
+        NextPacketIsDataUl = false;
+      }
       // counter can be increased even for normal DataUl messages since it's reset if a real bind message should be sent
       BindingSendCount++;
       // If not in TlmBurst, request a sync packet soon to trigger higher download bandwidth for reply
@@ -597,6 +609,10 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
     {
       // always enable DataUl after a channel package since the slot is only used if DataUlSender has data to send
       NextPacketIsDataUl = true;
+      if (isMavlinkMode)
+      {
+        MavlinkDataUlBurstRemaining = MAVLINK_DATA_UL_BURST_PACKETS;
+      }
 
       OtaPackChannelData(&otaPkt, ChannelData, DataDlReceiver.GetCurrentConfirm());
     }
