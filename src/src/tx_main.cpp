@@ -54,6 +54,15 @@ FIFO<AP_MAX_BUF_LEN> apOutputBuffer;
 FIFO<UART_INPUT_BUF_LEN> uartInputBuffer;
 
 uint8_t mavlinkSSBuffer[CRSF_MAX_PACKET_LEN]; // Buffer for current stubbon sender packet (mavlink only)
+static constexpr uint8_t MAVLINK_STX_V1 = 0xFE;
+static constexpr uint8_t MAVLINK_STX_V2 = 0xFD;
+static constexpr uint16_t MAVLINK_FRAME_BUFFER_LEN = 280;
+static uint8_t mavlinkFrameBuffer[MAVLINK_FRAME_BUFFER_LEN];
+static uint16_t mavlinkFramePos = 0;
+static uint16_t mavlinkFrameExpectedLen = 0;
+static uint8_t latestMavlinkFrameBuffer[MAVLINK_FRAME_BUFFER_LEN];
+static uint16_t latestMavlinkFrameLen = 0;
+static bool latestMavlinkFramePending = false;
 
 extern bool webserverPreventAutoStart;
 //// MSP Data Handling ///////
@@ -61,6 +70,112 @@ bool NextPacketIsDataUl = false;  // if true the next packet will contain the up
 static constexpr uint8_t MAVLINK_DATA_UL_BURST_PACKETS = 2;
 static uint8_t MavlinkDataUlBurstRemaining = 0;
 char backpackVersion[32] = "";
+
+static void queueNormalMavlinkFrame(const uint8_t *frame, const uint16_t len)
+{
+  uartInputBuffer.lock();
+  uartInputBuffer.pushBytes(frame, len);
+  uartInputBuffer.unlock();
+}
+
+static void storeLatestMavlinkFrame(const uint8_t *frame, const uint16_t len)
+{
+  memcpy(latestMavlinkFrameBuffer, frame, len);
+  latestMavlinkFrameLen = len;
+  latestMavlinkFramePending = true;
+}
+
+static uint32_t getMavlinkFrameMsgId(const uint8_t *frame)
+{
+  if (frame[0] == MAVLINK_STX_V2)
+  {
+    return (uint32_t)frame[7] | ((uint32_t)frame[8] << 8) | ((uint32_t)frame[9] << 16);
+  }
+
+  return frame[5];
+}
+
+static bool isLatestOnlyMavlinkMessage(const uint32_t msgId)
+{
+  // Message ids from MAVLink common.xml. These are realtime setpoint/control/target
+  // messages, so a newer frame makes an older queued frame less useful.
+  switch (msgId)
+  {
+  case 69:    // MANUAL_CONTROL
+  case 70:    // RC_CHANNELS_OVERRIDE
+  case 81:    // MANUAL_SETPOINT
+  case 82:    // SET_ATTITUDE_TARGET
+  case 84:    // SET_POSITION_TARGET_LOCAL_NED
+  case 86:    // SET_POSITION_TARGET_GLOBAL_INT
+  case 139:   // SET_ACTUATOR_CONTROL_TARGET
+  case 144:   // FOLLOW_TARGET
+  case 149:   // LANDING_TARGET
+  case 282:   // GIMBAL_MANAGER_SET_ATTITUDE
+  case 284:   // GIMBAL_DEVICE_SET_ATTITUDE
+  case 287:   // GIMBAL_MANAGER_SET_PITCHYAW
+  case 288:   // GIMBAL_MANAGER_SET_MANUAL_CONTROL
+  case 12921: // INTERCEPTOR_TARGET
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void processMavlinkUplinkBytes(const uint8_t *bytes, const uint16_t size)
+{
+  for (uint16_t i = 0; i < size; ++i)
+  {
+    const uint8_t c = bytes[i];
+
+    if (mavlinkFramePos == 0)
+    {
+      if (c != MAVLINK_STX_V1 && c != MAVLINK_STX_V2)
+      {
+        continue;
+      }
+      mavlinkFrameExpectedLen = 0;
+    }
+
+    if (mavlinkFramePos >= MAVLINK_FRAME_BUFFER_LEN)
+    {
+      mavlinkFramePos = 0;
+      mavlinkFrameExpectedLen = 0;
+      continue;
+    }
+
+    mavlinkFrameBuffer[mavlinkFramePos++] = c;
+
+    if (mavlinkFrameBuffer[0] == MAVLINK_STX_V1 && mavlinkFramePos == 2)
+    {
+      mavlinkFrameExpectedLen = 6U + mavlinkFrameBuffer[1] + 2U;
+    }
+    else if (mavlinkFrameBuffer[0] == MAVLINK_STX_V2 && mavlinkFramePos == 3)
+    {
+      mavlinkFrameExpectedLen = 10U + mavlinkFrameBuffer[1] + 2U + ((mavlinkFrameBuffer[2] & 0x01) ? 13U : 0U);
+    }
+
+    if (mavlinkFrameExpectedLen > MAVLINK_FRAME_BUFFER_LEN)
+    {
+      mavlinkFramePos = 0;
+      mavlinkFrameExpectedLen = 0;
+    }
+
+    if (mavlinkFrameExpectedLen > 0 && mavlinkFramePos >= mavlinkFrameExpectedLen)
+    {
+      const uint32_t msgId = getMavlinkFrameMsgId(mavlinkFrameBuffer);
+      if (isLatestOnlyMavlinkMessage(msgId) && mavlinkFrameExpectedLen <= CRSF_PAYLOAD_SIZE_MAX)
+      {
+        storeLatestMavlinkFrame(mavlinkFrameBuffer, mavlinkFrameExpectedLen);
+      }
+      else
+      {
+        queueNormalMavlinkFrame(mavlinkFrameBuffer, mavlinkFrameExpectedLen);
+      }
+      mavlinkFramePos = 0;
+      mavlinkFrameExpectedLen = 0;
+    }
+  }
+}
 
 ////////////SYNC PACKET/////////
 /// sync packet spamming on mode change vars ///
@@ -1180,9 +1295,7 @@ static void HandleUARTin()
     }
     if (config.GetLinkMode() == TX_MAVLINK_MODE)
     {
-      uartInputBuffer.lock();
-      uartInputBuffer.pushBytes(buf, size);
-      uartInputBuffer.unlock();
+      processMavlinkUplinkBytes(buf, size);
     }
     else
     {
@@ -1204,9 +1317,7 @@ static void HandleUARTin()
       // If the TX is in Mavlink mode, push the bytes into the fifo buffer
       if (config.GetLinkMode() == TX_MAVLINK_MODE)
       {
-        uartInputBuffer.lock();
-        uartInputBuffer.pushBytes(buf, size);
-        uartInputBuffer.unlock();
+        processMavlinkUplinkBytes(buf, size);
 
         // The TX is in MAVLink mode and receiving data from the Backpack,
         // start the radio since the user might be operating the module as a standalone unit without a handset.
@@ -1230,7 +1341,7 @@ static void HandleUARTin()
     uint8_t *nextPayload = 0;
     uint8_t nextPlayloadSize = 0;
     uint16_t count = uartInputBuffer.size();
-    if (count > 0 && !DataUlSender.IsActive())
+    if (!DataUlSender.IsActive() && count > 0)
     {
       count = std::min(count, (uint16_t)CRSF_PAYLOAD_SIZE_MAX);
       mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM; // Used on RX to differentiate between std msp opcodes and mavlink
@@ -1241,6 +1352,16 @@ static void HandleUARTin()
       uartInputBuffer.unlock();
       nextPayload = mavlinkSSBuffer;
       nextPlayloadSize = count + CRSF_FRAME_NOT_COUNTED_BYTES;
+      DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
+    }
+    else if (!DataUlSender.IsActive() && latestMavlinkFramePending)
+    {
+      mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM;
+      mavlinkSSBuffer[1] = latestMavlinkFrameLen;
+      memcpy(mavlinkSSBuffer + CRSF_FRAME_NOT_COUNTED_BYTES, latestMavlinkFrameBuffer, latestMavlinkFrameLen);
+      nextPayload = mavlinkSSBuffer;
+      nextPlayloadSize = latestMavlinkFrameLen + CRSF_FRAME_NOT_COUNTED_BYTES;
+      latestMavlinkFramePending = false;
       DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
     }
   }
