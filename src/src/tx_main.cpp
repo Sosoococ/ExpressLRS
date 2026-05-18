@@ -57,18 +57,25 @@ uint8_t mavlinkSSBuffer[CRSF_MAX_PACKET_LEN]; // Buffer for current stubbon send
 static constexpr uint8_t MAVLINK_STX_V1 = 0xFE;
 static constexpr uint8_t MAVLINK_STX_V2 = 0xFD;
 static constexpr uint16_t MAVLINK_FRAME_BUFFER_LEN = 280;
+static constexpr uint16_t MAVLINK_LATEST_FRAME_BUFFER_LEN = CRSF_PAYLOAD_SIZE_MAX;
 static uint8_t mavlinkFrameBuffer[MAVLINK_FRAME_BUFFER_LEN];
 static uint16_t mavlinkFramePos = 0;
 static uint16_t mavlinkFrameExpectedLen = 0;
-static uint8_t latestMavlinkFrameBuffer[MAVLINK_FRAME_BUFFER_LEN];
+static uint8_t latestMavlinkFrameBuffer[MAVLINK_LATEST_FRAME_BUFFER_LEN];
 static uint16_t latestMavlinkFrameLen = 0;
 static bool latestMavlinkFramePending = false;
 
 extern bool webserverPreventAutoStart;
 //// MSP Data Handling ///////
 bool NextPacketIsDataUl = false;  // if true the next packet will contain the uplink data (instead of channels)
-static constexpr uint8_t MAVLINK_DATA_UL_BURST_PACKETS = 2;
+static constexpr uint8_t MAVLINK_DATA_UL_BURST_PACKETS_NORMAL = 1;
+static constexpr uint8_t MAVLINK_DATA_UL_BURST_PACKETS_BOOST = 2;
+static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_INC = 3;
+static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_DEC = 1;
+static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_THRESHOLD = 3;
+static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_MAX = 24;
 static uint8_t MavlinkDataUlBurstRemaining = 0;
+static uint8_t MavlinkDataUlPressure = 0;
 char backpackVersion[32] = "";
 
 static void queueNormalMavlinkFrame(const uint8_t *frame, const uint16_t len)
@@ -78,11 +85,40 @@ static void queueNormalMavlinkFrame(const uint8_t *frame, const uint16_t len)
   uartInputBuffer.unlock();
 }
 
+extern StubbornSender DataUlSender;
+
 static void storeLatestMavlinkFrame(const uint8_t *frame, const uint16_t len)
 {
+  if (latestMavlinkFramePending || DataUlSender.IsActive())
+  {
+    MavlinkDataUlPressure = std::min(
+      (uint8_t)MAVLINK_DATA_UL_PRESSURE_MAX,
+      (uint8_t)(MavlinkDataUlPressure + MAVLINK_DATA_UL_PRESSURE_INC));
+  }
+  else if (MavlinkDataUlPressure > 0)
+  {
+    MavlinkDataUlPressure--;
+  }
+
   memcpy(latestMavlinkFrameBuffer, frame, len);
   latestMavlinkFrameLen = len;
   latestMavlinkFramePending = true;
+}
+
+static uint8_t getMavlinkDataUlBurstPackets()
+{
+  if (MavlinkDataUlPressure >= MAVLINK_DATA_UL_PRESSURE_THRESHOLD)
+  {
+    MavlinkDataUlPressure -= std::min(MavlinkDataUlPressure, MAVLINK_DATA_UL_PRESSURE_DEC);
+    return MAVLINK_DATA_UL_BURST_PACKETS_BOOST;
+  }
+
+  if (MavlinkDataUlPressure > 0)
+  {
+    MavlinkDataUlPressure--;
+  }
+
+  return MAVLINK_DATA_UL_BURST_PACKETS_NORMAL;
 }
 
 static uint32_t getMavlinkFrameMsgId(const uint8_t *frame)
@@ -98,22 +134,22 @@ static uint32_t getMavlinkFrameMsgId(const uint8_t *frame)
 static bool isLatestOnlyMavlinkMessage(const uint32_t msgId)
 {
   // Message ids from MAVLink common.xml. These are realtime setpoint/control/target
-  // messages, so a newer frame makes an older queued frame less useful.
+  // messages, so a newer frame makes an older queued frame less useful, and they are also sent with the highest priority.
   switch (msgId)
   {
-  case 69:    // MANUAL_CONTROL
-  case 70:    // RC_CHANNELS_OVERRIDE
-  case 81:    // MANUAL_SETPOINT
-  case 82:    // SET_ATTITUDE_TARGET
-  case 84:    // SET_POSITION_TARGET_LOCAL_NED
-  case 86:    // SET_POSITION_TARGET_GLOBAL_INT
-  case 139:   // SET_ACTUATOR_CONTROL_TARGET
-  case 144:   // FOLLOW_TARGET
-  case 149:   // LANDING_TARGET
-  case 282:   // GIMBAL_MANAGER_SET_ATTITUDE
-  case 284:   // GIMBAL_DEVICE_SET_ATTITUDE
-  case 287:   // GIMBAL_MANAGER_SET_PITCHYAW
-  case 288:   // GIMBAL_MANAGER_SET_MANUAL_CONTROL
+  // case 69:    // MANUAL_CONTROL
+  // case 70:    // RC_CHANNELS_OVERRIDE
+  // case 81:    // MANUAL_SETPOINT
+  // case 82:    // SET_ATTITUDE_TARGET
+  // case 84:    // SET_POSITION_TARGET_LOCAL_NED
+  // case 86:    // SET_POSITION_TARGET_GLOBAL_INT
+  // case 139:   // SET_ACTUATOR_CONTROL_TARGET
+  // case 144:   // FOLLOW_TARGET
+  // case 149:   // LANDING_TARGET
+  // case 282:   // GIMBAL_MANAGER_SET_ATTITUDE
+  // case 284:   // GIMBAL_DEVICE_SET_ATTITUDE
+  // case 287:   // GIMBAL_MANAGER_SET_PITCHYAW
+  // case 288:   // GIMBAL_MANAGER_SET_MANUAL_CONTROL
   case 12921: // INTERCEPTOR_TARGET
     return true;
   default:
@@ -726,7 +762,7 @@ void ICACHE_RAM_ATTR SendRCdataToRF()
       NextPacketIsDataUl = true;
       if (isMavlinkMode)
       {
-        MavlinkDataUlBurstRemaining = MAVLINK_DATA_UL_BURST_PACKETS;
+        MavlinkDataUlBurstRemaining = getMavlinkDataUlBurstPackets();
       }
 
       OtaPackChannelData(&otaPkt, ChannelData, DataDlReceiver.GetCurrentConfirm());
@@ -1341,7 +1377,17 @@ static void HandleUARTin()
     uint8_t *nextPayload = 0;
     uint8_t nextPlayloadSize = 0;
     uint16_t count = uartInputBuffer.size();
-    if (!DataUlSender.IsActive() && count > 0)
+    if (!DataUlSender.IsActive() && latestMavlinkFramePending)
+    {
+      mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM;
+      mavlinkSSBuffer[1] = latestMavlinkFrameLen;
+      memcpy(mavlinkSSBuffer + CRSF_FRAME_NOT_COUNTED_BYTES, latestMavlinkFrameBuffer, latestMavlinkFrameLen);
+      nextPayload = mavlinkSSBuffer;
+      nextPlayloadSize = latestMavlinkFrameLen + CRSF_FRAME_NOT_COUNTED_BYTES;
+      latestMavlinkFramePending = false;
+      DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
+    }
+    else if (!DataUlSender.IsActive() && count > 0)
     {
       count = std::min(count, (uint16_t)CRSF_PAYLOAD_SIZE_MAX);
       mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM; // Used on RX to differentiate between std msp opcodes and mavlink
@@ -1352,16 +1398,6 @@ static void HandleUARTin()
       uartInputBuffer.unlock();
       nextPayload = mavlinkSSBuffer;
       nextPlayloadSize = count + CRSF_FRAME_NOT_COUNTED_BYTES;
-      DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
-    }
-    else if (!DataUlSender.IsActive() && latestMavlinkFramePending)
-    {
-      mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM;
-      mavlinkSSBuffer[1] = latestMavlinkFrameLen;
-      memcpy(mavlinkSSBuffer + CRSF_FRAME_NOT_COUNTED_BYTES, latestMavlinkFrameBuffer, latestMavlinkFrameLen);
-      nextPayload = mavlinkSSBuffer;
-      nextPlayloadSize = latestMavlinkFrameLen + CRSF_FRAME_NOT_COUNTED_BYTES;
-      latestMavlinkFramePending = false;
       DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
     }
   }
