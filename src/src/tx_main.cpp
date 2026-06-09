@@ -52,10 +52,12 @@ FIFO<AP_MAX_BUF_LEN> apOutputBuffer;
 
 #define UART_INPUT_BUF_LEN 1024
 FIFO<UART_INPUT_BUF_LEN> uartInputBuffer;
+FIFO<UART_INPUT_BUF_LEN> rtcmInputBuffer;
 
 uint8_t mavlinkSSBuffer[CRSF_MAX_PACKET_LEN]; // Buffer for current stubbon sender packet (mavlink only)
 static constexpr uint8_t MAVLINK_STX_V1 = 0xFE;
 static constexpr uint8_t MAVLINK_STX_V2 = 0xFD;
+static constexpr uint32_t MAVLINK_MSG_ID_GPS_RTCM_DATA = 233;
 static constexpr uint16_t MAVLINK_FRAME_BUFFER_LEN = 280;
 static constexpr uint16_t MAVLINK_LATEST_FRAME_BUFFER_LEN = CRSF_PAYLOAD_SIZE_MAX;
 static uint8_t mavlinkFrameBuffer[MAVLINK_FRAME_BUFFER_LEN];
@@ -74,8 +76,17 @@ static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_INC = 3;
 static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_DEC = 1;
 static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_THRESHOLD = 3;
 static constexpr uint8_t MAVLINK_DATA_UL_PRESSURE_MAX = 24;
+static constexpr uint16_t MAVLINK_RTCM_BYTES_PER_SECOND = 300;
+static constexpr uint16_t MAVLINK_RTCM_TOKEN_MAX = MAVLINK_RTCM_BYTES_PER_SECOND;
+static constexpr uint16_t MAVLINK_RTCM_INACTIVE_TIMEOUT_MS = 1000;
 static uint8_t MavlinkDataUlBurstRemaining = 0;
 static uint8_t MavlinkDataUlPressure = 0;
+static uint32_t MavlinkRtcmTokenLastMs = 0;
+static uint32_t MavlinkRtcmTokenCredit = 0;
+static uint32_t MavlinkRtcmLastReceivedMs = 0;
+static uint8_t rtcmMavlinkFrameBuffer[MAVLINK_FRAME_BUFFER_LEN];
+static uint16_t rtcmMavlinkFrameLen = 0;
+static uint16_t rtcmMavlinkFrameOffset = 0;
 char backpackVersion[32] = "";
 
 static void queueNormalMavlinkFrame(const uint8_t *frame, const uint16_t len)
@@ -85,11 +96,29 @@ static void queueNormalMavlinkFrame(const uint8_t *frame, const uint16_t len)
   uartInputBuffer.unlock();
 }
 
+static void queueRtcmMavlinkFrame(const uint8_t *frame, const uint16_t len)
+{
+  if (len + 2U > UART_INPUT_BUF_LEN || len > MAVLINK_FRAME_BUFFER_LEN)
+  {
+    return;
+  }
+
+  rtcmInputBuffer.lock();
+  if (rtcmInputBuffer.free() < len + 2U)
+  {
+    rtcmInputBuffer.flush();
+  }
+  rtcmInputBuffer.pushSize(len);
+  rtcmInputBuffer.pushBytes(frame, len);
+  rtcmInputBuffer.unlock();
+  MavlinkRtcmLastReceivedMs = millis();
+}
+
 extern StubbornSender DataUlSender;
 
-static void storeLatestMavlinkFrame(const uint8_t *frame, const uint16_t len)
+static void updateMavlinkPriorityPressure()
 {
-  if (latestMavlinkFramePending || DataUlSender.IsActive())
+  if (latestMavlinkFramePending || DataUlSender.IsActive() || uartInputBuffer.size() > 0 || rtcmInputBuffer.size() > 0 || rtcmMavlinkFrameOffset < rtcmMavlinkFrameLen)
   {
     MavlinkDataUlPressure = std::min(
       (uint8_t)MAVLINK_DATA_UL_PRESSURE_MAX,
@@ -99,7 +128,10 @@ static void storeLatestMavlinkFrame(const uint8_t *frame, const uint16_t len)
   {
     MavlinkDataUlPressure--;
   }
+}
 
+static void storeLatestMavlinkFrame(const uint8_t *frame, const uint16_t len)
+{
   memcpy(latestMavlinkFrameBuffer, frame, len);
   latestMavlinkFrameLen = len;
   latestMavlinkFramePending = true;
@@ -121,6 +153,103 @@ static uint8_t getMavlinkDataUlBurstPackets()
   return MAVLINK_DATA_UL_BURST_PACKETS_NORMAL;
 }
 
+static void updateMavlinkRtcmTokens()
+{
+  const uint32_t now = millis();
+  if (MavlinkRtcmTokenLastMs == 0)
+  {
+    MavlinkRtcmTokenLastMs = now;
+    return;
+  }
+
+  const uint32_t elapsed = now - MavlinkRtcmTokenLastMs;
+  MavlinkRtcmTokenLastMs = now;
+  const uint32_t maxCredit = (uint32_t)MAVLINK_RTCM_TOKEN_MAX * 1000U;
+  const uint32_t addedCredit = elapsed * (uint32_t)MAVLINK_RTCM_BYTES_PER_SECOND;
+  MavlinkRtcmTokenCredit = std::min(
+    maxCredit,
+    MavlinkRtcmTokenCredit + addedCredit);
+}
+
+static void consumeMavlinkRtcmTokens(const uint16_t bytes)
+{
+  const uint32_t used = (uint32_t)bytes * 1000UL;
+  MavlinkRtcmTokenCredit = used >= MavlinkRtcmTokenCredit ? 0 : MavlinkRtcmTokenCredit - used;
+}
+
+static uint16_t getMavlinkRtcmAllowedBytes()
+{
+  updateMavlinkRtcmTokens();
+  return MavlinkRtcmTokenCredit / 1000UL;
+}
+
+static bool isMavlinkRtcmFrameActive()
+{
+  return rtcmMavlinkFrameOffset < rtcmMavlinkFrameLen;
+}
+
+static uint16_t peekQueuedMavlinkRtcmFrameLen()
+{
+  rtcmInputBuffer.lock();
+  const uint16_t frameLen = rtcmInputBuffer.peekSize();
+  const bool completeFrameQueued = frameLen > 0 && rtcmInputBuffer.size() >= frameLen + 2U;
+  rtcmInputBuffer.unlock();
+  return completeFrameQueued ? frameLen : 0;
+}
+
+static bool loadNextMavlinkRtcmFrame()
+{
+  rtcmInputBuffer.lock();
+  const uint16_t frameLen = rtcmInputBuffer.peekSize();
+  if (frameLen == 0 || frameLen > MAVLINK_FRAME_BUFFER_LEN || rtcmInputBuffer.size() < frameLen + 2U)
+  {
+    rtcmInputBuffer.unlock();
+    return false;
+  }
+
+  rtcmInputBuffer.popSize();
+  rtcmInputBuffer.popBytes(rtcmMavlinkFrameBuffer, frameLen);
+  rtcmInputBuffer.unlock();
+
+  rtcmMavlinkFrameLen = frameLen;
+  rtcmMavlinkFrameOffset = 0;
+  consumeMavlinkRtcmTokens(frameLen);
+  return true;
+}
+
+static void setNextMavlinkRtcmPayload(uint8_t **nextPayload, uint8_t *nextPayloadSize)
+{
+  const uint16_t remaining = rtcmMavlinkFrameLen - rtcmMavlinkFrameOffset;
+  const uint16_t count = std::min(remaining, (uint16_t)CRSF_PAYLOAD_SIZE_MAX);
+  mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM;
+  mavlinkSSBuffer[1] = count;
+  memcpy(
+    mavlinkSSBuffer + CRSF_FRAME_NOT_COUNTED_BYTES,
+    rtcmMavlinkFrameBuffer + rtcmMavlinkFrameOffset,
+    count);
+  rtcmMavlinkFrameOffset += count;
+  if (rtcmMavlinkFrameOffset >= rtcmMavlinkFrameLen)
+  {
+    rtcmMavlinkFrameLen = 0;
+    rtcmMavlinkFrameOffset = 0;
+  }
+  *nextPayload = mavlinkSSBuffer;
+  *nextPayloadSize = count + CRSF_FRAME_NOT_COUNTED_BYTES;
+}
+
+static void flushInactiveMavlinkRtcm()
+{
+  if (MavlinkRtcmLastReceivedMs && millis() - MavlinkRtcmLastReceivedMs > MAVLINK_RTCM_INACTIVE_TIMEOUT_MS)
+  {
+    rtcmInputBuffer.lock();
+    rtcmInputBuffer.flush();
+    rtcmInputBuffer.unlock();
+    MavlinkRtcmLastReceivedMs = 0;
+    rtcmMavlinkFrameLen = 0;
+    rtcmMavlinkFrameOffset = 0;
+  }
+}
+
 static uint32_t getMavlinkFrameMsgId(const uint8_t *frame)
 {
   if (frame[0] == MAVLINK_STX_V2)
@@ -129,6 +258,18 @@ static uint32_t getMavlinkFrameMsgId(const uint8_t *frame)
   }
 
   return frame[5];
+}
+
+static bool isPriorityMavlinkMessage(const uint32_t msgId)
+{
+  switch (msgId)
+  {
+  case 12921: // INTERCEPTOR_TARGET
+  // case 233:   // GPS_RTCM_DATA
+    return true;
+  default:
+    return false;
+  }
 }
 
 static bool isLatestOnlyMavlinkMessage(const uint32_t msgId)
@@ -199,7 +340,15 @@ static void processMavlinkUplinkBytes(const uint8_t *bytes, const uint16_t size)
     if (mavlinkFrameExpectedLen > 0 && mavlinkFramePos >= mavlinkFrameExpectedLen)
     {
       const uint32_t msgId = getMavlinkFrameMsgId(mavlinkFrameBuffer);
-      if (isLatestOnlyMavlinkMessage(msgId) && mavlinkFrameExpectedLen <= CRSF_PAYLOAD_SIZE_MAX)
+      if (isPriorityMavlinkMessage(msgId))
+      {
+        updateMavlinkPriorityPressure();
+      }
+      if (msgId == MAVLINK_MSG_ID_GPS_RTCM_DATA)
+      {
+        queueRtcmMavlinkFrame(mavlinkFrameBuffer, mavlinkFrameExpectedLen);
+      }
+      else if (isLatestOnlyMavlinkMessage(msgId) && mavlinkFrameExpectedLen <= CRSF_PAYLOAD_SIZE_MAX)
       {
         storeLatestMavlinkFrame(mavlinkFrameBuffer, mavlinkFrameExpectedLen);
       }
@@ -1376,8 +1525,17 @@ static void HandleUARTin()
     // Use DataUlSender for MAVLINK uplink data
     uint8_t *nextPayload = 0;
     uint8_t nextPlayloadSize = 0;
+    flushInactiveMavlinkRtcm();
     uint16_t count = uartInputBuffer.size();
-    if (!DataUlSender.IsActive() && latestMavlinkFramePending)
+    uint16_t rtcmCount = rtcmInputBuffer.size();
+    uint16_t allowedRtcmBytes = rtcmCount > 0 ? getMavlinkRtcmAllowedBytes() : 0;
+    uint16_t nextRtcmFrameLen = isMavlinkRtcmFrameActive() ? 0 : peekQueuedMavlinkRtcmFrameLen();
+    if (!DataUlSender.IsActive() && isMavlinkRtcmFrameActive())
+    {
+      setNextMavlinkRtcmPayload(&nextPayload, &nextPlayloadSize);
+      DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
+    }
+    else if (!DataUlSender.IsActive() && latestMavlinkFramePending)
     {
       mavlinkSSBuffer[0] = MSP_ELRS_MAVLINK_TLM;
       mavlinkSSBuffer[1] = latestMavlinkFrameLen;
@@ -1385,6 +1543,11 @@ static void HandleUARTin()
       nextPayload = mavlinkSSBuffer;
       nextPlayloadSize = latestMavlinkFrameLen + CRSF_FRAME_NOT_COUNTED_BYTES;
       latestMavlinkFramePending = false;
+      DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
+    }
+    else if (!DataUlSender.IsActive() && nextRtcmFrameLen > 0 && allowedRtcmBytes >= nextRtcmFrameLen && loadNextMavlinkRtcmFrame())
+    {
+      setNextMavlinkRtcmPayload(&nextPayload, &nextPlayloadSize);
       DataUlSender.SetDataToTransmit(nextPayload, nextPlayloadSize);
     }
     else if (!DataUlSender.IsActive() && count > 0)
